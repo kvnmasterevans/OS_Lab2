@@ -82,6 +82,9 @@ struct trapframe {
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
+#define MAX_TICKETS     10000  // upper bound for sched_tickets()
+#define DEFAULT_TICKETS 10000  // tickets given to every new process
+
 struct proc {
   struct spinlock lock;
 
@@ -91,9 +94,9 @@ struct proc {
   int killed;                  // If non-zero, have been killed
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
-  int tickets;
-  int ticks;
-  uint pass;
+  int tickets;                 // Scheduling tickets (lottery/stride share)
+  int ticks;                   // Times this process was scheduled to run
+  uint pass;                   // Stride scheduler pass value
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process

@@ -89,3 +89,22 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// Print PID, name, tickets, and scheduled-tick count of each process.
+uint64
+sys_sched_statistics(void)
+{
+  sched_statistics();
+  return 0;
+}
+
+// Set the caller's ticket value (at most MAX_TICKETS).
+uint64
+sys_sched_tickets(void)
+{
+  int n;
+
+  argint(0, &n);
+  sched_tickets(n);
+  return 0;
+}

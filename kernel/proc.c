@@ -124,7 +124,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
-  p->tickets = 10000;
+  p->tickets = DEFAULT_TICKETS;
   p->ticks = 0;
   p->pass = 0;
 
@@ -463,6 +463,9 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        // Count every dispatch for sched_statistics(). Keep this on the
+        // common dispatch path so it works for every scheduler policy.
+        p->ticks++;
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -683,4 +686,38 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// Print scheduling statistics for every process in use:
+// PID, name, ticket value, and number of times it was scheduled.
+void
+sched_statistics(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state != UNUSED)
+      printf("%d(%s): tickets: %d, ticks: %d\n",
+             p->pid, p->name, p->tickets, p->ticks);
+    release(&p->lock);
+  }
+}
+
+// Set the calling process's ticket value, clamped to
+// [1, MAX_TICKETS]. A process always keeps at least one ticket
+// so it can still be scheduled (and stride never divides by 0).
+void
+sched_tickets(int n)
+{
+  struct proc *p = myproc();
+
+  if(n > MAX_TICKETS)
+    n = MAX_TICKETS;
+  if(n < 1)
+    n = 1;
+
+  acquire(&p->lock);
+  p->tickets = n;
+  release(&p->lock);
 }
