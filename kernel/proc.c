@@ -126,6 +126,7 @@ found:
   p->state = USED;
   p->tickets = DEFAULT_TICKETS;
   p->ticks = 0;
+  p->stride = STRIDE1 / DEFAULT_TICKETS;
   p->pass = 0;
 
   // Allocate a trapframe page.
@@ -277,6 +278,32 @@ growproc(int n)
   return 0;
 }
 
+#if defined(STRIDE)
+// Current stride "virtual time": the minimum pass among RUNNABLE and
+// RUNNING processes other than skip (skip may be 0). Sets *found to 0
+// if there is no such process. Holds only one proc lock at a time.
+static uint64
+stride_min_pass(struct proc *skip, int *found)
+{
+  struct proc *q;
+  uint64 minpass = 0;
+
+  *found = 0;
+  for(q = proc; q < &proc[NPROC]; q++){
+    if(q == skip)
+      continue;
+    acquire(&q->lock);
+    if((q->state == RUNNABLE || q->state == RUNNING) &&
+       (!*found || q->pass < minpass)){
+      minpass = q->pass;
+      *found = 1;
+    }
+    release(&q->lock);
+  }
+  return minpass;
+}
+#endif
+
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 int
@@ -286,10 +313,21 @@ fork(void)
   struct proc *np;
   struct proc *p = myproc();
 
+#if defined(STRIDE)
+  // The child joins at the current virtual time (which includes the
+  // running parent's pass) instead of at pass 0. Otherwise a child of
+  // a long-running parent would monopolize the CPU until it caught up.
+  int found;
+  uint64 vtime = stride_min_pass(0, &found);
+#endif
+
   // Allocate process.
   if((np = allocproc()) == 0){
     return -1;
   }
+#if defined(STRIDE)
+  np->pass = vtime + np->stride;
+#endif
 
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
@@ -487,12 +525,24 @@ scheduler(void)
       release(&p->lock);
     }
 #elif defined(STRIDE)
-    // TODO(stride): run the RUNNABLE process with the minimum pass.
+    // Basic stride scheduling (Waldspurger & Weihl, Sec 2.1): run the
+    // RUNNABLE process with the minimum pass, then advance its pass by
+    // its stride. Ties go to the earliest proc[] slot (strict <).
+    struct proc *best = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if(p->state == RUNNABLE)
-        run_proc(c, p);
+      if(p->state == RUNNABLE && (best == 0 || p->pass < best->pass))
+        best = p;
       release(&p->lock);
+    }
+    if(best) {
+      acquire(&best->lock);
+      // Re-check: the state may have changed after the scan released it.
+      if(best->state == RUNNABLE) {
+        best->pass += best->stride;
+        run_proc(c, best);
+      }
+      release(&best->lock);
     }
 #else
     // Original xv6 round-robin scheduler.
@@ -736,6 +786,10 @@ sched_statistics(void)
 // Set the calling process's ticket value, clamped to
 // [1, MAX_TICKETS]. A process always keeps at least one ticket
 // so it can still be scheduled (and stride never divides by 0).
+// Also recomputes the stride. Under STRIDE, the caller's pass is
+// reset to (minimum pass of the other active processes) + stride,
+// so a process that sets its tickets late starts at the current
+// virtual time instead of at 0 and cannot monopolize the CPU.
 void
 sched_tickets(int n)
 {
@@ -746,7 +800,18 @@ sched_tickets(int n)
   if(n < 1)
     n = 1;
 
+#if defined(STRIDE)
+  int found;
+  uint64 minpass = stride_min_pass(p, &found);
+#endif
+
   acquire(&p->lock);
   p->tickets = n;
+  p->stride = STRIDE1 / n;
+#if defined(STRIDE)
+  // With no other RUNNABLE process, the caller's own pass is the
+  // current virtual time.
+  p->pass = (found ? minpass : p->pass) + p->stride;
+#endif
   release(&p->lock);
 }
