@@ -437,6 +437,25 @@ wait(uint64 addr)
   }
 }
 
+// Run process p on CPU c. The caller must hold p->lock and p must be
+// RUNNABLE. Shared by every scheduler policy so that the dispatch
+// count reported by sched_statistics() is correct for all of them.
+static void
+run_proc(struct cpu *c, struct proc *p)
+{
+  // Switch to chosen process.  It is the process's job
+  // to release its lock and then reacquire it
+  // before jumping back to us.
+  p->state = RUNNING;
+  c->proc = p;
+  p->ticks++;
+  swtch(&c->context, &p->context);
+
+  // Process is done running for now.
+  // It should have changed its p->state before coming back.
+  c->proc = 0;
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -444,6 +463,8 @@ wait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+// The policy is chosen at compile time with LAB2=LOTTERY|STRIDE|RR.
+// Each policy only picks a RUNNABLE process and calls run_proc().
 void
 scheduler(void)
 {
@@ -455,25 +476,33 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
+#if defined(LOTTERY)
+    // TODO(lottery): draw a winning ticket with rand() among RUNNABLE
+    // processes and run_proc() the winner. Until then, fall back to
+    // round-robin so LOTTERY builds still boot.
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        // Count every dispatch for sched_statistics(). Keep this on the
-        // common dispatch path so it works for every scheduler policy.
-        p->ticks++;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-      }
+      if(p->state == RUNNABLE)
+        run_proc(c, p);
       release(&p->lock);
     }
+#elif defined(STRIDE)
+    // TODO(stride): run the RUNNABLE process with the minimum pass.
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE)
+        run_proc(c, p);
+      release(&p->lock);
+    }
+#else
+    // Original xv6 round-robin scheduler.
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE)
+        run_proc(c, p);
+      release(&p->lock);
+    }
+#endif
   }
 }
 
