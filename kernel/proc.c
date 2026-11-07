@@ -437,6 +437,23 @@ wait(uint64 addr)
   }
 }
 
+
+
+
+
+// Random Number Generator Method provided by the assignment write-up
+unsigned short lfsr = 0xACE1u;
+unsigned short bit;
+
+unsigned short rand()
+{
+    bit = ((lfsr >> 0) ^ (lfsr >> 2) ^
+           (lfsr >> 3) ^ (lfsr >> 5)) & 1;
+
+    return lfsr = (lfsr >> 1) | (bit << 15);
+}
+
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -455,6 +472,19 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
+    unsigned int total_tickets = 0;
+
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+
+      if(p->state == RUNNABLE) {
+        total_tickets += p->tickets;
+      }
+
+      release(&p->lock);
+    }
+
+/*
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
@@ -473,7 +503,40 @@ scheduler(void)
         c->proc = 0;
       }
       release(&p->lock);
+    }*/
+
+
+   if(total_tickets > 0) {
+      unsigned int winning_ticket = rand() % total_tickets;
+
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+
+        if(p->state == RUNNABLE) {
+          if(winning_ticket < p->tickets) {
+
+            p->state = RUNNING;
+            c->proc = p;
+            p->ticks++;
+
+            swtch(&c->context, &p->context);
+
+            c->proc = 0;
+
+            release(&p->lock);
+            break;
+          }
+
+          winning_ticket -= p->tickets;
+        }
+
+        release(&p->lock);
+      }
     }
+
+
+
+
   }
 }
 
