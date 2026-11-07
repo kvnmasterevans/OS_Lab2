@@ -126,6 +126,7 @@ found:
   p->state = USED;
   p->tickets = DEFAULT_TICKETS;
   p->ticks = 0;
+  p->stride = STRIDE1 / DEFAULT_TICKETS;
   p->pass = 0;
 
   // Allocate a trapframe page.
@@ -277,6 +278,32 @@ growproc(int n)
   return 0;
 }
 
+#if defined(STRIDE)
+// Current stride "virtual time": the minimum pass among RUNNABLE and
+// RUNNING processes other than skip (skip may be 0). Sets *found to 0
+// if there is no such process. Holds only one proc lock at a time.
+static uint64
+stride_min_pass(struct proc *skip, int *found)
+{
+  struct proc *q;
+  uint64 minpass = 0;
+
+  *found = 0;
+  for(q = proc; q < &proc[NPROC]; q++){
+    if(q == skip)
+      continue;
+    acquire(&q->lock);
+    if((q->state == RUNNABLE || q->state == RUNNING) &&
+       (!*found || q->pass < minpass)){
+      minpass = q->pass;
+      *found = 1;
+    }
+    release(&q->lock);
+  }
+  return minpass;
+}
+#endif
+
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 int
@@ -286,10 +313,21 @@ fork(void)
   struct proc *np;
   struct proc *p = myproc();
 
+#if defined(STRIDE)
+  // The child joins at the current virtual time (which includes the
+  // running parent's pass) instead of at pass 0. Otherwise a child of
+  // a long-running parent would monopolize the CPU until it caught up.
+  int found;
+  uint64 vtime = stride_min_pass(0, &found);
+#endif
+
   // Allocate process.
   if((np = allocproc()) == 0){
     return -1;
   }
+#if defined(STRIDE)
+  np->pass = vtime + np->stride;
+#endif
 
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
@@ -437,10 +475,6 @@ wait(uint64 addr)
   }
 }
 
-
-
-
-
 // Random Number Generator Method provided by the assignment write-up
 unsigned short lfsr = 0xACE1u;
 unsigned short bit;
@@ -454,59 +488,48 @@ unsigned short rand()
 }
 
 
+// Run process p on CPU c. The caller must hold p->lock and p must be
+// RUNNABLE. Shared by every scheduler policy so that the dispatch
+// count reported by sched_statistics() is correct for all of them.
+static void
+run_proc(struct cpu *c, struct proc *p)
+{
+  // Switch to chosen process. The process releases its lock and
+  // reacquires it before jumping back to us.
+  p->state = RUNNING;
+  c->proc = p;
+  p->ticks++;
+  swtch(&c->context, &p->context);
+
+  // Process is done running for now.
+  c->proc = 0;
+}
+
+
 // Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
 void
 scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
-    // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
+#if defined(LOTTERY)
     unsigned int total_tickets = 0;
 
+    // Count tickets belonging to RUNNABLE processes.
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-
-      if(p->state == RUNNABLE) {
+      if(p->state == RUNNABLE)
         total_tickets += p->tickets;
-      }
-
       release(&p->lock);
     }
 
-/*
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        // Count every dispatch for sched_statistics(). Keep this on the
-        // common dispatch path so it works for every scheduler policy.
-        p->ticks++;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-      }
-      release(&p->lock);
-    }*/
-
-
-   if(total_tickets > 0) {
+    // Draw a winning ticket and find the process that owns it.
+    if(total_tickets > 0) {
       unsigned int winning_ticket = rand() % total_tickets;
 
       for(p = proc; p < &proc[NPROC]; p++) {
@@ -514,15 +537,7 @@ scheduler(void)
 
         if(p->state == RUNNABLE) {
           if(winning_ticket < p->tickets) {
-
-            p->state = RUNNING;
-            c->proc = p;
-            p->ticks++;
-
-            swtch(&c->context, &p->context);
-
-            c->proc = 0;
-
+            run_proc(c, p);
             release(&p->lock);
             break;
           }
@@ -534,9 +549,35 @@ scheduler(void)
       }
     }
 
+#elif defined(STRIDE)
+    // Run the RUNNABLE process with the minimum pass.
+    struct proc *best = 0;
 
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE && (best == 0 || p->pass < best->pass))
+        best = p;
+      release(&p->lock);
+    }
 
+    if(best) {
+      acquire(&best->lock);
+      if(best->state == RUNNABLE) {
+        best->pass += best->stride;
+        run_proc(c, best);
+      }
+      release(&best->lock);
+    }
 
+#else
+    // Original xv6 round-robin scheduler.
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE)
+        run_proc(c, p);
+      release(&p->lock);
+    }
+#endif
   }
 }
 
@@ -770,6 +811,10 @@ sched_statistics(void)
 // Set the calling process's ticket value, clamped to
 // [1, MAX_TICKETS]. A process always keeps at least one ticket
 // so it can still be scheduled (and stride never divides by 0).
+// Also recomputes the stride. Under STRIDE, the caller's pass is
+// reset to (minimum pass of the other active processes) + stride,
+// so a process that sets its tickets late starts at the current
+// virtual time instead of at 0 and cannot monopolize the CPU.
 void
 sched_tickets(int n)
 {
@@ -780,7 +825,18 @@ sched_tickets(int n)
   if(n < 1)
     n = 1;
 
+#if defined(STRIDE)
+  int found;
+  uint64 minpass = stride_min_pass(p, &found);
+#endif
+
   acquire(&p->lock);
   p->tickets = n;
+  p->stride = STRIDE1 / n;
+#if defined(STRIDE)
+  // With no other RUNNABLE process, the caller's own pass is the
+  // current virtual time.
+  p->pass = (found ? minpass : p->pass) + p->stride;
+#endif
   release(&p->lock);
 }

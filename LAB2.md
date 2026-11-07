@@ -11,18 +11,19 @@ whenever you change lab2-related code, so the report can be written from it.
 | Part 1 | Per-process `tickets`, `ticks`, `pass` fields | Done |
 | Part 1 | `sched_statistics()` syscall | Done |
 | Part 1 | `sched_tickets(int)` syscall | Done |
-| Part 1 | Tick counting on dispatch | Done (round-robin only so far) |
+| Part 1 | Tick counting on dispatch | Done, shared by all schedulers via `run_proc()` |
 | Test | `user/lab2.c` test program | Done |
-| Part 2 | Makefile `LAB2` switch (`-DRR` / `-DLOTTERY` / `-DSTRIDE`) | Not started |
-| Part 2 | `CPUS := 1` in Makefile | Not started (pass `CPUS=1` on the command line meanwhile) |
-| Part 2 | Lottery scheduler + provided `rand()` | Not started |
-| Part 2 | Stride scheduler (K = 10000) | Not started |
+| Part 2 | Makefile `LAB2` switch (`-DRR` / `-DLOTTERY` / `-DSTRIDE`) | Done |
+| Part 2 | `CPUS := 1` in Makefile | Done |
+| Part 2 | Scheduler `#if` skeleton and `run_proc()` helper | Done |
+| Part 2 | Lottery scheduler + provided `rand()` | Not started (falls back to round-robin) |
+| Part 2 | Stride scheduler (K = 10000) | Done and tested |
 | Part 3 | Experiments (8:4:2:1 and 1:1:1:1, 20–100 ticks, ≥5 runs) | Not started |
 | Submit | Report PDF, demo video | Not started |
 
 ## Changes
 
-### Setup: toolchain fixes (commit `ec23a70`)
+### Setup: toolchain fixes (commit `ec23a70`, linker script fixed later)
 
 Needed for newer compilers such as Ubuntu's GCC 15. They also work with
 older toolchains such as GCC 13 on Ubuntu 24.04.
@@ -34,6 +35,17 @@ older toolchains such as GCC 13 on Ubuntu 24.04.
 - **`user/usertests.c`**: changed `rwsbrk()` to `rwsbrk(char *s)` to match
   the other test functions. GCC 15's C23 default made the old declaration
   a type error.
+
+- **`user/user.ld`**: added a `PHDRS` block with two load segments.
+  Code and read-only data go in a read+execute segment, and data and
+  bss go in a read+write segment. `.data` is page-aligned with
+  `ALIGN(0x1000)`, because `exec()` rejects segments that do not start
+  on a page. Without this, newer linkers emit a single RWX segment.
+  User code is then writable and `usertests` `textwrite` fails.
+  `exec()` already maps each segment with the permissions in its
+  header, so no kernel change was needed. The linker still prints
+  the "RWX permissions" warning for the kernel, `initcode` and
+  `forktest`. Those are linked separately and do not affect the tests.
 
 Because of these two Makefile lines, the lab handout's "lines 72-73"
 reference for inserting `LAB2 = RR` is now two lines lower.
@@ -84,6 +96,52 @@ path of every scheduler variant, either after the `#if` selection logic
 or once in each branch. Otherwise `sched_statistics` will be wrong for
 that scheduler.
 
+### Part 2: shared scheduler setup (commit `bec7e23`)
+
+- **`Makefile`**: `LAB2 = RR` and `CFLAGS += -D$(LAB2)` after the
+  `-fno-pie` block, as the handout specifies. `CPUS := 1`.
+- **`kernel/proc.c` `run_proc(c, p)`**: the dispatch steps shared by
+  every policy. It sets the process RUNNING, increments `p->ticks`, and
+  switches to it. The caller must hold `p->lock` and `p` must be
+  RUNNABLE. This keeps the tick count correct under every scheduler.
+- **`kernel/proc.c` `scheduler()`**: `#if defined(LOTTERY)` /
+  `#elif defined(STRIDE)` / `#else` round-robin. Each branch only picks
+  a process and calls `run_proc()`. The LOTTERY branch is still the
+  round-robin loop with a `TODO(lottery)` so LOTTERY builds boot.
+
+### Part 2: stride scheduler (commit `46c9a41`)
+
+Basic stride scheduling from Sec 2.1 of the paper, plus a join rule so
+processes that start late do not monopolize the CPU.
+
+- **`kernel/proc.h`**: `STRIDE1` (10000, the constant K), `int stride`
+  (`STRIDE1 / tickets`), and `pass` widened from `uint` to `uint64`.
+  The handout does not require 64 bits. We chose it so pass values
+  cannot overflow, as the paper's appendix recommends.
+- **`allocproc()`**: `stride = STRIDE1 / DEFAULT_TICKETS`, which is 1.
+- **`scheduler()` STRIDE branch**:
+  1. Scan `proc[]` for the RUNNABLE process with the smallest pass.
+     Ties go to the lowest slot because the comparison is strict `<`.
+  2. Lock it and check it is still RUNNABLE.
+  3. Add its stride to its pass and call `run_proc()`.
+- **`stride_min_pass(skip, &found)`**: returns the smallest pass among
+  RUNNABLE and RUNNING processes other than `skip`. This serves as the
+  current "virtual time". It holds only one process lock at a time.
+- **Pass reset in `sched_tickets()`**: recomputes the stride. Under
+  STRIDE it also sets the caller's pass to the virtual time plus its new
+  stride. If no other process is active, the caller's own pass is used.
+- **Pass reset in `fork()`**: under STRIDE the child's pass is the
+  virtual time, which includes the running parent, plus the child's
+  stride.
+
+  This one is required, not optional. Without it a new child starts at
+  pass 0. The child of a long-running parent then runs alone until it
+  catches up with the parent's pass. `usertests -q` hung in
+  `killstatus` because of this.
+
+Integer strides round down: 30:20:10 gives 333 / 500 / 1000, and
+19:1 gives 526 / 10000. 8:4:2:1 divides exactly.
+
 ### Test program
 
 - **`user/lab2.c`**: the handout's test program, copied verbatim.
@@ -96,17 +154,16 @@ switching schedulers, because the `-D` flag does not trigger a rebuild.
 
 ```sh
 # Original round-robin scheduler
-make clean; make qemu CPUS=1
+make clean; make qemu
 
-# Lottery scheduler (after Part 2 adds the LAB2 switch)
-make clean; make qemu LAB2=LOTTERY CPUS=1
+# Lottery scheduler
+make clean; make qemu LAB2=LOTTERY
 
-# Stride scheduler (after Part 2 adds the LAB2 switch)
-make clean; make qemu LAB2=STRIDE CPUS=1
+# Stride scheduler
+make clean; make qemu LAB2=STRIDE
 ```
 
-Exit QEMU with `Ctrl-a` then `x`. Once the Makefile sets `CPUS := 1`,
-the `CPUS=1` argument is no longer needed.
+Exit QEMU with `Ctrl-a` then `x`.
 
 ## Tests (inside the xv6 shell)
 
@@ -137,7 +194,30 @@ Only the child lines (the last N lines) matter. Each child's share is its
 |-----------|-------------------------------|
 | Round-robin | About equal ticks, tickets ignored. Verified: 34 / 34 / 34. |
 | Lottery | Roughly 1/2, 1/3, 1/6, with random variation. |
-| Stride | Very close to 1/2, 1/3, 1/6, deterministic. |
+| Stride | 1/2, 1/3, 1/6. Verified: 50 / 33 / 17, identical across runs. |
+
+Verified stride results for the other tests:
+
+| Test | Child ticks |
+|------|-------------|
+| `lab2 100 2 19 1` | 95 / 5 |
+| `lab2 100 4 8 4 2 1` | 53 / 27 / 13 / 7 |
+| `lab2 100 4 1 1 1 1` | 25 / 25 / 25 / 25 |
+| `lab2 20 4 8 4 2 1` | 10 / 5 / 3 / 2 |
+
+The parent `lab2` process also shows about 100 ticks. That is expected:
+`sleep()` wakes it on every timer tick to re-check the time.
+
+### Regression check
+
+```sh
+usertests -q
+```
+
+This takes a few minutes. It prints `ALL TESTS PASSED` under both RR and
+STRIDE. During `textwrite` you will see a `usertrap(): unexpected scause
+0xf` line. That is expected: the test writes to read-only code and
+checks that the kernel kills it.
 
 ### Non-interactive run (for scripts)
 

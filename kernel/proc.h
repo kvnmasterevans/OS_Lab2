@@ -84,6 +84,7 @@ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 // Per-process state
 #define MAX_TICKETS     10000  // upper bound for sched_tickets()
 #define DEFAULT_TICKETS 10000  // tickets given to every new process
+#define STRIDE1         10000  // stride scheduler constant K: stride = STRIDE1 / tickets
 
 struct proc {
   struct spinlock lock;
@@ -96,7 +97,8 @@ struct proc {
   int pid;                     // Process ID
   int tickets;                 // Scheduling tickets (lottery/stride share)
   int ticks;                   // Times this process was scheduled to run
-  uint pass;                   // Stride scheduler pass value
+  int stride;                  // Stride scheduler stride, STRIDE1 / tickets
+  uint64 pass;                 // Stride scheduler pass value (64-bit: no overflow)
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
