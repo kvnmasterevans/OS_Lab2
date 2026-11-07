@@ -23,7 +23,7 @@ whenever you change lab2-related code, so the report can be written from it.
 
 ## Changes
 
-### Setup: toolchain fixes (commit `ec23a70`)
+### Setup: toolchain fixes (commit `ec23a70`, linker script fixed later)
 
 Needed for newer compilers such as Ubuntu's GCC 15. They also work with
 older toolchains such as GCC 13 on Ubuntu 24.04.
@@ -35,6 +35,17 @@ older toolchains such as GCC 13 on Ubuntu 24.04.
 - **`user/usertests.c`**: changed `rwsbrk()` to `rwsbrk(char *s)` to match
   the other test functions. GCC 15's C23 default made the old declaration
   a type error.
+
+- **`user/user.ld`**: added a `PHDRS` block with two load segments.
+  Code and read-only data go in a read+execute segment, and data and
+  bss go in a read+write segment. `.data` is page-aligned with
+  `ALIGN(0x1000)`, because `exec()` rejects segments that do not start
+  on a page. Without this, newer linkers emit a single RWX segment.
+  User code is then writable and `usertests` `textwrite` fails.
+  `exec()` already maps each segment with the permissions in its
+  header, so no kernel change was needed. The linker still prints
+  the "RWX permissions" warning for the kernel, `initcode` and
+  `forktest`. Those are linked separately and do not affect the tests.
 
 Because of these two Makefile lines, the lab handout's "lines 72-73"
 reference for inserting `LAB2 = RR` is now two lines lower.
@@ -203,10 +214,10 @@ The parent `lab2` process also shows about 100 ticks. That is expected:
 usertests -q
 ```
 
-This takes a few minutes. Under RR and STRIDE, every test passes except
-`textwrite`. That failure comes from the toolchain, not the scheduler.
-The newer linker puts user code and data in one writable segment (the
-"RWX permissions" warning), so writing to address 0 does not fault.
+This takes a few minutes. It prints `ALL TESTS PASSED` under both RR and
+STRIDE. During `textwrite` you will see a `usertrap(): unexpected scause
+0xf` line. That is expected: the test writes to read-only code and
+checks that the kernel kills it.
 
 ### Non-interactive run (for scripts)
 
